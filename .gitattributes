@@ -1,0 +1,10 @@
+# normalise line endings
+* text=auto
+*.c text
+*.h text
+*.inc text linguist-language=C
+*.s text linguist-language=Assembly
+Makefile text
+
+# assembled binaries (if ever committed) are binary
+*.bin binary

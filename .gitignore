@@ -1,0 +1,54 @@
+# Build artifacts
+*.o
+*.a
+*.bin
+*.obj
+*.lib
+*.exp
+*.exe
+
+# Debug info (MSVC; macOS dsymutil)
+*.pdb
+*.ilk
+*.dSYM/
+
+# Coverage and profiling
+*.gcno
+*.gcda
+*.gcov
+*.profraw
+*.profdata
+
+# Crash dumps (sanitizer/fuzzing sessions leave these in the cwd).
+# Note: this also ignores any file or directory literally named "core";
+# there is none in this tree, but rename the pattern if that changes.
+core
+core.*
+vgcore.*
+
+# Default compiler output
+a.out
+
+# Per-directory binaries.  This is an exact-path list, so ADD AN ENTRY
+# HERE WHEN YOU ADD A TOOL — a new or renamed binary is not covered by
+# any pattern above and would otherwise be committable.  The `no build
+# artifacts` CI job fails the build if that is ever forgotten.
+dsp3210dis/dsp3210dis
+dsp3210dis/test_dsp3210
+dsp3210asm/dsp3210asm
+dsp3210asm/test_dsp3210_asm
+dsp3210emu/dsp3210emu
+dsp3210emu/test_dsp3210_emu
+dsp3210emu/dsp3210emu-exact
+dsp3210emu/test_dsp3210_emu_exact
+toolchain-tests/roundtrip
+toolchain-tests/run_apps
+toolchain-tests/run_apps_exact
+
+# Editor and OS cruft
+.DS_Store
+*~
+*.swp
+*.swo
+.vscode/
+.idea/

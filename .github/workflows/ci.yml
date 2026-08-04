@@ -1,0 +1,76 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cc: gcc
+          - os: ubuntu-latest
+            cc: clang
+          - os: macos-latest
+            cc: clang
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: make CC=${{ matrix.cc }}
+      - name: test
+        # every suite: dis/asm/emu unit tests (emu on both DAUs), the
+        # ~12M-word asm<->dis roundtrip sweep, and the test programs
+        # executed on both DAUs
+        run: make test CC=${{ matrix.cc }}
+
+  no-build-artifacts:
+    # A full build must leave the working tree clean.  The per-directory
+    # binary entries in .gitignore are an exact-path list, so a new or
+    # renamed tool would otherwise become quietly committable; this job
+    # turns that into a build failure.  It also checks that `make clean`
+    # removes everything `make` created.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build, then require a clean tree
+        run: |
+          make
+          make -C dsp3210dis test_dsp3210
+          make -C dsp3210asm test_dsp3210_asm
+          if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+            echo "::error::the build left files that git would commit:"
+            git status --porcelain --untracked-files=all
+            echo "Add them to .gitignore (see the per-directory list)."
+            exit 1
+          fi
+          echo "build leaves no committable artifacts"
+      - name: require make clean to restore the tree
+        run: |
+          make clean
+          if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+            echo "::error::make clean did not remove everything make built:"
+            git status --porcelain --untracked-files=all
+            exit 1
+          fi
+          echo "make clean restores a pristine tree"
+
+  sanitizers:
+    # The same suites under AddressSanitizer, UndefinedBehaviorSanitizer
+    # and LeakSanitizer.  A reference model is only ground truth if it is
+    # free of undefined behaviour, and the numeric results can be right
+    # while the C is not -- exactly the kind of defect the plain build
+    # cannot see.
+    runs-on: ubuntu-latest
+    env:
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+      ASAN_OPTIONS: detect_leaks=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: build and test with -fsanitize=address,undefined
+        # The sanitizer flags go through CC so they reach both the
+        # compile and the link steps.
+        run: make CC="gcc -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer" test
