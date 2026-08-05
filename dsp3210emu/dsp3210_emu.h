@@ -191,10 +191,54 @@ typedef struct dsp3210_emu {
                                     (the waiti latent instruction) */
     int      last_vector;        /* last vector raised (incl. masked) */
 
+    /*
+     * --- DAU pipeline latency model [IM §4.4.2] ---
+     * a_pipe[k]        = the accumulator file as it stood after
+     *                    instruction n-1-k; the multiplier reads its
+     *                    accumulator inputs from a_pipe[2] (Latency 2)
+     * dau_flag_pipe[k] = the ps N/Z/U/V nibble after instruction n-1-k;
+     *                    conditional branches/ALU on DAU conditions test
+     *                    dau_flag_pipe[3] (Latency 4; ifalt/ifaeq/ifagt
+     *                    stay zero-latency per the manual)
+     * da_wr            = DA memory-write shadow: a DA store is not
+     *                    readable by the DSP itself for the next three
+     *                    instructions (Latency 1); reads overlay the
+     *                    pre-write bytes while an entry lives.  Memory
+     *                    itself is committed immediately, so hosts,
+     *                    DMA and faults are unaffected; instruction
+     *                    fetch is exempt.  So is hook-backed memory:
+     *                    the shadow can only snapshot the built-in map,
+     *                    and probing a hook for the pre-write bytes
+     *                    could trigger MMIO read side effects, so
+     *                    setting read_fn/write_fn disables the shadow
+     *                    (model the latency host-side if you need it).
+     */
+    dsp3210_accslot a_pipe[3][4];
+    uint8_t  dau_flag_pipe[4];
+    struct dsp3210_da_wr {
+        uint32_t addr;
+        uint8_t  size, rem, live, old[4];
+    } da_wr[4];
+    int      in_fetch;           /* fetch in progress: bypass da_wr */
+
+    /*
+     * --- external interrupt pins (EXT0/EXT1) ---
+     * ps.IR0/IR1 mirror the LIVE pin level (1 = negated: the pins are
+     * active-low, so idle pins read set, including right after reset).
+     * ext_pulse[] counts how many more core time slots (executed
+     * instructions or waiti sleep slots) each pin stays asserted after
+     * dsp3210_ext_pulse().  The latched interrupt *request* (`pending`)
+     * is separate: taking the interrupt clears the request, never the
+     * pin.
+     */
+    uint32_t ext_pulse[2];       /* [0] = EXT0/vector 8, [1] = EXT1/15 */
+
     /* interrupt shadow registers [IM §7.5.1; ps/ctr per Figure 4-1] */
     uint16_t sh_ps;
     uint8_t  sh_dauc, sh_ctr;
     dsp3210_accslot sh_a[4];
+    dsp3210_accslot sh_a_pipe[3][4];
+    uint8_t  sh_dau_flag_pipe[4];
     int      sh_do_active, sh_do_lock;
     uint32_t sh_do_start, sh_do_end, sh_do_count;
 
@@ -229,8 +273,22 @@ void dsp3210_reset(dsp3210_emu *s, unsigned straps);
 int dsp3210_step(dsp3210_emu *s);
 
 /* Assert an interrupt request (vector 8..15).  It is taken when the
- * corresponding emr bit is set and the processor is at base level. */
+ * corresponding emr bit is set and the processor is at base level.
+ * This latches the REQUEST only; it does not touch the ps IR0/IR1 pin
+ * bits — use dsp3210_ext_pulse for pin-accurate EXT0/EXT1 modelling. */
 void dsp3210_request_interrupt(dsp3210_emu *s, int vector);
+
+/*
+ * Pulse an external interrupt pin (vector 8 = EXT0, 15 = EXT1): latch
+ * the interrupt request and assert the live pin — ps.IR0/IR1 reads 0
+ * (asserted) — for `slots` units of core time, where one slot elapses
+ * per executed instruction and per waiti sleep step.  Guest code that
+ * polls the pin level (`if (ir1s) goto …`) sees a pulse of that width.
+ * Note: a write to emr with bit 0 set drops a latched-but-untaken EXT1
+ * request without taking it (hardware-verified kernel behaviour); the
+ * pin level is unaffected.
+ */
+void dsp3210_ext_pulse(dsp3210_emu *s, int vector, unsigned slots);
 
 /* Copy bytes into emulated memory through the address map (for loading
  * program images).  Returns 0, or -1 if part of the range is unmapped. */

@@ -211,14 +211,25 @@ int main(void)
            "a0 = -(*r2++r16 = *r1) * *r8--");          /* FMULT-TAP */
     expect(da(3, 0, 0, 0, 0, 0x00, 0x00, 0x07),
            "a0 = a0 + a0 * a0");                       /* all defaults */
-    /* Apple's assembler encodes "no Z write" as 0x7F (seen in the ROM
-     * '3210' segments and enabler dspf modules), not the manual's 0x07 */
-    expect(0x3440087F, "a2 = *r2 + a0");
-    expect(0x3800079F, "a0 = (*r3++ = *r1++) + a0");
+    /* Z with p=1111: a store through the Y operand's own effective
+     * address, Z's I bits post-modifying Y's pointer (hardware-verified
+     * against shipped in-place converts and buffer scales).  With an
+     * accumulator Y there is nothing to store through — the source of
+     * the old "0x7F is a second no-write spelling" misreading. */
+    expect(0x3440087F, "*r2++ = a2 = *r2 + a0");     /* MAC, i=111 */
+    expect(0x7000487F, "*r2++ = a0 = *r2 * a1");     /* in-place scale */
+    expect(0x2415E07F, "*r8++ = a0 = *r8 + a1 * *r10++");
+    expect(0x380008FA, "a0 = (*r2++r16 = *r2++r15) + a0"); /* tap thru-Y */
+    expect(0x446010F9, "a3 = a1 + (*r4++r15 = *r4++r15) * a0");
+    expect(0x700000FF, "a0 = a1 * a0");              /* acc Y: no write */
+    expect(0x3800079F, "a0 = (*r3++ = *r1++) + a0"); /* normal tap Z */
 
     /* ---- DA special functions — IM chapter 4.6 examples ---- */
     expect(sf(0,  0, 0x17, 0x0F), "*r1++ = a0 = ic(*r2++)");
     expect(sf(1,  1, 0x01, 0x07), "a1 = oc(a1)");
+    /* fmt-5 Z p=1111: the shipped in-place int->float convert */
+    expect(0x7C000478, "*r1 = a0 = float32(*r1)");
+    expect(0x7C0000F8, "a0 = float32(a1)");          /* acc Y: no write */
     expect(sf(2,  3, 0x10, 0x09), "*r1++r15 = a3 = float16(*r2)");
     expect(sf(8,  3, 0x10, 0x2B), "*r5++r17 = a3 = float32(*r2)");
     expect(sf(3,  0, 0x00, 0x18), "*r3 = a0 = int16(a0)");

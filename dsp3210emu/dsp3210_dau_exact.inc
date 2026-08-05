@@ -389,8 +389,14 @@ static dsp3210_acc da_flags(dsp3210_emu *s, dsp3210_acc res, int affect_vu)
 typedef struct {
     int      from_acc;   /* 1: accumulator (or reserved field) */
     unsigned acc;        /* accumulator number when from_acc */
-    uint32_t raw;        /* raw bits read when memory */
-    dsp3210_acc val;     /* the accumulator itself when from_acc */
+    uint32_t raw;        /* raw bits read when memory; for an
+                            accumulator, the MULTIPLIER-lane value:
+                            guard-truncated and three instructions
+                            stale (Latency 2) [IM §4.4.2.2] */
+    dsp3210_acc val;     /* the live accumulator (adder lane) */
+    int      is_mem;     /* 1: memory operand; ea/preg below valid */
+    uint32_t ea;         /* effective address (before post-modify) */
+    unsigned preg;       /* pointer register number (1-14) */
 } da_opnd;
 
 static void da_postmod(dsp3210_emu *s, unsigned p, unsigned i, int size)
@@ -415,33 +421,57 @@ static int da_read(dsp3210_emu *s, unsigned f, int size, da_opnd *o)
         o->from_acc = 1;
         o->acc = i & 3;
         o->val = s->a[i & 3].x;
-        o->raw = dsp3210_acc_pack(s->a[i & 3].x);  /* guard bits truncated,
-                                        as when an accumulator feeds the
-                                        multiplier [IM §8.2.3] */
+        /* multiplier lane: guard bits truncated [IM §8.2.3] AND the
+         * value established three instructions back (Latency 2) */
+        o->raw = dsp3210_acc_pack(s->a_pipe[2][i & 3].x);
         return 0;
     }
+    o->is_mem = 1;
+    o->ea = s->r[p];
+    o->preg = p;
     if (mem_read(s, s->r[p], size, &o->raw))
         return -1;
     da_postmod(s, p, i, size);
     return 0;
 }
 
-/* "No write" Z spellings: manual uses p=0000,i=111; Apple's assembler
- * uses p=1111,i=111 — both accepted (README of dsp3210dis). */
-static int da_z_is_write(unsigned z)
+/*
+ * The Z field's store behaviour (hardware-verified against shipped
+ * in-place converts and buffer scales; the manual's Table 10-3 calls
+ * p=1111 "not allowed"):
+ *   p = 0001-1110  store through the Z field's own pointer register;
+ *   p = 1111       store through the *Y operand's* own effective
+ *                  address, the Z I bits post-modifying Y's POINTER
+ *                  register — with an accumulator Y there is nothing
+ *                  to store through and no write happens (the source
+ *                  of the old "0x7F = no write" misreading);
+ *   p = 0000       never stores.
+ */
+static int da_z_writes(unsigned z, const da_opnd *y)
 {
-    unsigned p = (z >> 3) & 15, i = z & 7;
-    if (i == 7 && (p == 0 || p == 15))
+    unsigned p = (z >> 3) & 15;
+    if (p == 0)
         return 0;
-    return p != 0;
+    if (p != 15)
+        return 1;
+    return y->is_mem;
 }
 
-static int da_write(dsp3210_emu *s, unsigned f, int size, uint32_t val)
+static int da_store_z(dsp3210_emu *s, unsigned z, const da_opnd *y,
+                      int size, uint32_t val)
 {
-    unsigned p = (f >> 3) & 15, i = f & 7;
-    if (p == 0 || p == 15)
-        return 0;                      /* no write */
-    if (mem_write(s, s->r[p], size, val))
+    unsigned p = (z >> 3) & 15, i = z & 7;
+    if (p == 0)
+        return 0;
+    if (p == 15) {                     /* through Y's effective address */
+        if (!y->is_mem)
+            return 0;
+        if (da_shadowed_write(s, y->ea, size, val))
+            return -1;
+        da_postmod(s, y->preg, i, size);
+        return 0;
+    }
+    if (da_shadowed_write(s, s->r[p], size, val))
         return -1;
     da_postmod(s, p, i, size);
     return 0;
@@ -451,11 +481,17 @@ static int da_write(dsp3210_emu *s, unsigned f, int size, uint32_t val)
  * ifalt/ifaeq/ifagt pages are explicit: with dauc[6] = 1 the memory
  * write is conditional "but the address postmodifications are always
  * performed". */
-static void da_postmod_only(dsp3210_emu *s, unsigned f, int size)
+static void da_postmod_only(dsp3210_emu *s, unsigned z, const da_opnd *y,
+                            int size)
 {
-    unsigned p = (f >> 3) & 15, i = f & 7;
-    if (p == 0 || p == 15)
+    unsigned p = (z >> 3) & 15, i = z & 7;
+    if (p == 0)
         return;
+    if (p == 15) {
+        if (y->is_mem)
+            da_postmod(s, y->preg, i, size);
+        return;
+    }
     da_postmod(s, p, i, size);
 }
 
@@ -531,13 +567,37 @@ enum {
 };
 
 
+/*
+ * Deposit a 32-bit integer in an accumulator's mantissa+guard lane
+ * (bits 39-8).  The INT32/INT16/OC pages are explicit:
+ * "the result is stored in the 32 MSBs of an accumulator (aN), the
+ * mantissa, and guard bits" / "the upper 16 bits" / "the most
+ * significant byte" — only the exponent is unpredictable.  That lane
+ * is where ic/float16/float32 read their accumulator operand, so
+ * float32(int32(x)) is a DEFINED round trip that shipped code uses
+ * (the RTM sound-input rate converter splits its phase accumulator
+ * with it).  m = v ± 2^31 lands normalised for every 32-bit v; the
+ * exponent keeps the adder input's (a zero exponent means "zero"
+ * throughout the model and would erase the lane; the manual calls the
+ * exponent unpredictable, so any choice that keeps the lane intact is
+ * faithful).
+ */
+static dsp3210_acc acc_int_lane(int32_t v, dsp3210_acc adder)
+{
+    dsp3210_acc a;
+    a.m = (v >= 0) ? (int64_t)v + ((int64_t)1 << 31)
+                   : (int64_t)v - ((int64_t)1 << 31);
+    a.e = adder.e;
+    return a;
+}
+
 static int exec_da_special(dsp3210_emu *s, uint32_t w)
 {
     unsigned g = bits(w, 26, 23);
     unsigned n = bits(w, 22, 21);
     unsigned y = bits(w, 13, 7);
     unsigned z = bits(w, 6, 0);
-    int zw = da_z_is_write(z);
+    int zw;
     int ysz = (g == G_IC) ? 1 : (g == G_FLOAT16) ? 2 : 4;
     int zsz = (g == G_OC) ? 1 : (g == G_INT16) ? 2 : 4;
     da_opnd Y;
@@ -546,6 +606,7 @@ static int exec_da_special(dsp3210_emu *s, uint32_t w)
 
     if (da_read(s, y, ysz, &Y))
         return DSP3210_STEP_OK;
+    zw = da_z_writes(z, &Y);
 
     /* The special-function result reaches memory from the DAU's own S
      * register, which is why the manual requires the Z write to be
@@ -555,9 +616,16 @@ static int exec_da_special(dsp3210_emu *s, uint32_t w)
      * while the Z bits are exact. */
     switch (g) {
     case G_IC: {                               /* byte -> float, NZ00 */
-        unsigned code = Y.from_acc
-                      ? (unsigned)((dsp3210_acc_pack(Y.val) >> 24) & 0xFFu)
-                      : (Y.raw & 0xFFu);
+        /* IC page: the byte "must reside in the most significant byte
+         * of the accumulator" — the top byte of the integer lane. */
+        unsigned code;
+        if (Y.from_acc) {
+            int64_t mg;
+            dsp3210_acc_raw_of(Y.val, &mg);
+            code = (unsigned)(((uint32_t)mg >> 24) & 0xFFu);
+        } else {
+            code = Y.raw & 0xFFu;
+        }
         unsigned conv = s->dauc & 15;
         if (conv & 4) {                        /* x1xx unsigned linear in */
             res = acc_from_i64((int64_t)code);
@@ -581,14 +649,19 @@ static int exec_da_special(dsp3210_emu *s, uint32_t w)
         } else {                               /* mu-law / A-law out */
             code = companded_encode_acc(da_adder(&Y), (conv & 2) != 0);
         }
-        res = acc_from_i64((int64_t)code);
+        res = acc_int_lane((int32_t)(code << 24), da_adder(&Y));
         zbits = code;
         break;
     }
     case G_FLOAT16: {                          /* int16 -> float, NZ00 */
-        int64_t iv = Y.from_acc
-                   ? (int64_t)(int16_t)(dsp3210_acc_pack(Y.val) >> 16)
-                   : (int64_t)(int16_t)(Y.raw & 0xFFFFu);
+        int64_t iv;
+        if (Y.from_acc) {
+            int64_t mg;
+            dsp3210_acc_raw_of(Y.val, &mg);
+            iv = (int64_t)(int16_t)((uint32_t)mg >> 16);
+        } else {
+            iv = (int64_t)(int16_t)(Y.raw & 0xFFFFu);
+        }
         res = da_flags(s, acc_from_i64(iv), 0);
         zbits = dsp3210_acc_pack(res);
         break;
@@ -611,13 +684,15 @@ static int exec_da_special(dsp3210_emu *s, uint32_t w)
     }
     case G_INT16: {                            /* float -> int16, no flags */
         int64_t iv = acc_to_int(da_adder(&Y), s->dauc, 16);
-        res = acc_from_i64(iv);
+        res = acc_int_lane((int32_t)((uint32_t)iv << 16),
+                           da_adder(&Y));                  /* int lane */
         zbits = (uint32_t)iv & 0xFFFFu;
         break;
     }
     case G_INT32: {                            /* float -> int32, no flags */
         int64_t iv = acc_to_int(da_adder(&Y), s->dauc, 32);
-        res = acc_from_i64(iv);
+        res = acc_int_lane((int32_t)(uint32_t)iv,
+                           da_adder(&Y));                  /* int lane */
         zbits = (uint32_t)iv;
         break;
     }
@@ -639,7 +714,7 @@ static int exec_da_special(dsp3210_emu *s, uint32_t w)
         if (zw && (s->dauc & 0x40u) && !cond) {
             /* dauc[6] = 1: the store is conditional, but the pointer
              * post-modification still happens [IM IFALT/IFAEQ/IFAGT] */
-            da_postmod_only(s, z, zsz);
+            da_postmod_only(s, z, &Y, zsz);
             zw = 0;
         }
         break;
@@ -692,7 +767,7 @@ static int exec_da_special(dsp3210_emu *s, uint32_t w)
 
     s->a[n].x = res;
     if (zw)
-        da_write(s, z, zsz, zbits);
+        da_store_z(s, z, &Y, zsz, zbits);
     return DSP3210_STEP_OK;
 }
 
@@ -709,7 +784,7 @@ static int exec_da(dsp3210_emu *s, uint32_t w)
     unsigned zf  = bits(w, 6, 0);
     unsigned fs  = bits(w, 24, 24);    /* sign before the adder operand */
     unsigned ss  = bits(w, 23, 23);    /* sign of the product term */
-    int zw = da_z_is_write(zf);
+    int zw;
     da_opnd X, Y;
     dsp3210_acc adder, res;
     int64_t pm;
@@ -729,6 +804,7 @@ static int exec_da(dsp3210_emu *s, uint32_t w)
         return DSP3210_STEP_OK;
     if (da_read(s, yf, 4, &Y))
         return DSP3210_STEP_OK;
+    zw = da_z_writes(zf, &Y);
 
     if (fmt == 1 && m == 6) {
         /* FADD-TAP: aN = [-](Z=Y) {+,-} X */
@@ -743,8 +819,10 @@ static int exec_da(dsp3210_emu *s, uint32_t w)
         if (m == 4)
             { pm = 0; pe = 0; }                    /* 0.0 * X */
         else
-            dau_mul(m == 5 ? ONE : dsp3210_acc_pack(s->a[m].x),
-                    da_mult(&X), &pm, &pe);
+            dau_mul(m == 5 ? ONE
+                           : dsp3210_acc_pack(s->a_pipe[2][m].x),
+                    da_mult(&X), &pm, &pe);   /* aM: multiplier lane,
+                                                 3 insns stale (L2) */
         tap = 0;
     } else {
         /* fmt 2 (tap) / fmt 3 (store): aN = [-]{aM,0,1} {+,-} Y*X */
@@ -767,9 +845,13 @@ static int exec_da(dsp3210_emu *s, uint32_t w)
     s->a[n].x = res;
 
     if (zw) {
-        uint32_t zbits = tap ? da_mult(&Y)        /* the tap passes Y on */
-                             : dsp3210_acc_pack(res);
-        da_write(s, zf, 4, zbits);
+        /* the tap passes the Y operand on to memory.  For an
+         * accumulator Y the LIVE value is stored (only the multiplier
+         * arithmetic lane is latency-affected). */
+        uint32_t zbits = tap
+            ? (Y.from_acc ? dsp3210_acc_pack(s->a[Y.acc].x) : Y.raw)
+            : dsp3210_acc_pack(res);
+        da_store_z(s, zf, &Y, 4, zbits);
     }
     return DSP3210_STEP_OK;
 }
@@ -782,6 +864,10 @@ double dsp3210_acc_get(const dsp3210_emu *s, int n)
 void dsp3210_acc_set(dsp3210_emu *s, int n, double v)
 {
     s->a[n & 3].x = dsp3210_acc_from_double(v);
+    /* flush the multiplier-lane pipe so host pokes are instantaneous */
+    s->a_pipe[0][n & 3].x = s->a[n & 3].x;
+    s->a_pipe[1][n & 3].x = s->a[n & 3].x;
+    s->a_pipe[2][n & 3].x = s->a[n & 3].x;
 }
 
 void dsp3210_acc_raw(const dsp3210_emu *s, int n, int64_t *mant_guard,

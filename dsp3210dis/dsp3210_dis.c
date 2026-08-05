@@ -237,17 +237,60 @@ static int da_operand(sb *s, unsigned f, int is_z)
 }
 
 /*
- * "No write" Z encodings: the manual's examples use p=0000,i=111 (0x07),
- * but the assembler output shipped in real systems (Apple's Mac AV DSP
- * code) uses p=1111,i=111 (0x7F).  Since p=1111 cannot address
- * memory, treat i=111 with a non-pointer p as "no write" as well.
+ * Z-field classification.  The manual (Table 10-3) allows "no write"
+ * only as p=0000,i=111 (0x07) and calls p=1111 "not allowed" — but the
+ * assembler output shipped in real systems (Apple's Mac AV DSP code)
+ * uses p=1111 heavily, and its meaning is hardware-verified:
+ *
+ *   p = 1111 stores the result through the Y operand's own effective
+ *   address (its pre-post-modify address), and the Z field's I bits
+ *   post-modify Y's POINTER REGISTER.  When Y is an accumulator there
+ *   is nothing to store through and the instruction does not write —
+ *   which is how p=1111,i=111 (0x7F) was long misread as a second
+ *   spelling of "no write".  Shipped in-place buffer scales and
+ *   integer<->float converts depend on the store (e.g. the enabler's
+ *   sample-rate converter stores an int, converts it with
+ *   `a0 = float32(*r1)` Z=0x78, and reads the same word back as a
+ *   float).
+ *
+ * p = 0000 with i != 111 also decodes as "no write" (leniency; only
+ * i = 111 is architecturally allowed there).
  */
-static int da_z_is_write(unsigned z)
+enum { ZK_NONE, ZK_NORMAL, ZK_THRU_Y, ZK_BAD };
+
+static int da_z_kind(unsigned z, unsigned y)
 {
-    unsigned p = (z >> 3) & 15, i = z & 7;
-    if (i == 7 && (p == 0 || p == 15))
+    unsigned p = (z >> 3) & 15, yp = (y >> 3) & 15;
+    if (p == 0)
+        return ZK_NONE;
+    if (p != 15)
+        return ZK_NORMAL;
+    if (yp >= 1 && yp <= 14)
+        return ZK_THRU_Y;
+    if (yp == 0 && (y & 7) <= 3)
+        return ZK_NONE;              /* accumulator Y: nothing to store */
+    return ZK_BAD;                   /* p=1111 with unresolvable Y */
+}
+
+/* Print the Z destination.  ZK_THRU_Y renders as Y's pointer register
+ * with Z's own post-modification (what the store actually does).
+ * Returns 0 for reserved combinations. */
+static int da_z_print(sb *s, unsigned z, unsigned y, int kind)
+{
+    if (kind == ZK_NORMAL)
+        return da_operand(s, z, 1);
+    if (kind != ZK_THRU_Y) {
+        sb_puts(s, "?");
         return 0;
-    return p != 0;
+    }
+    sb_fmt(s, "*r%u", (y >> 3) & 15);
+    switch (z & 7) {
+    case 0:            break;
+    case 6: sb_puts(s, "--"); break;
+    case 7: sb_puts(s, "++"); break;
+    default: sb_fmt(s, "++r%u", 14 + (z & 7)); break;
+    }
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -268,7 +311,8 @@ static void dis_da(uint32_t w, dsp3210_insn *ins, sb *s)
     unsigned z   = bits(w, 6, 0);
     unsigned fs  = bits(w, 24, 24);       /* adder-input sign  (0=+ 1=-) */
     unsigned ss  = bits(w, 23, 23);       /* product sign      (0=+ 1=-) */
-    int      zw  = da_z_is_write(z);
+    int      zk  = da_z_kind(z, y);
+    int      zw  = (zk != ZK_NONE);
     int      ok  = 1;
 
     ins->klass = DSP3210_CLASS_DA;
@@ -280,7 +324,7 @@ static void dis_da(uint32_t w, dsp3210_insn *ins, sb *s)
 
         n = bits(w, 22, 21);
         if (zw) {
-            ok &= da_operand(s, z, 1);
+            ok &= da_z_print(s, z, y, zk);
             sb_puts(s, " = ");
         }
         sb_fmt(s, "a%u = ", n);
@@ -315,7 +359,7 @@ static void dis_da(uint32_t w, dsp3210_insn *ins, sb *s)
         int tap = (fmt == 2) || (fmt == 1 && m == 6);   /* Z=Y forms */
 
         if (zw && !tap) {
-            ok &= da_operand(s, z, 1);
+            ok &= da_z_print(s, z, y, zk);
             sb_puts(s, " = ");
         }
         sb_fmt(s, "a%u = ", n);
@@ -326,7 +370,7 @@ static void dis_da(uint32_t w, dsp3210_insn *ins, sb *s)
                 sb_puts(s, "-");
             if (zw) {
                 sb_puts(s, "(");
-                ok &= da_operand(s, z, 1);
+                ok &= da_z_print(s, z, y, zk);
                 sb_puts(s, " = ");
                 ok &= da_operand(s, y, 0);
                 sb_puts(s, ")");
@@ -380,7 +424,7 @@ static void dis_da(uint32_t w, dsp3210_insn *ins, sb *s)
             }
             if (fmt == 2 && zw) {
                 sb_puts(s, "(");
-                ok &= da_operand(s, z, 1);
+                ok &= da_z_print(s, z, y, zk);
                 sb_puts(s, " = ");
                 ok &= da_operand(s, y, 0);
                 sb_puts(s, ")");

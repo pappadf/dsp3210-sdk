@@ -105,6 +105,8 @@ static void regw(dsp3210_emu *s, unsigned code, uint32_t v)
 
 static int raw_access(dsp3210_emu *s, uint32_t addr, int size,
                       uint32_t *inout, int write);
+static void da_shadow_overlay(dsp3210_emu *s, uint32_t addr, int size,
+                              uint32_t *val);
 
 /* Raise an exception.  Returns 1 if the exception was actually taken
  * (the current instruction must abort), 0 if it was masked or ignored
@@ -165,6 +167,8 @@ static void take_interrupt(dsp3210_emu *s, int vn)
     s->sh_dauc = s->dauc;
     s->sh_ctr = s->ctr;
     memcpy(s->sh_a, s->a, sizeof s->a);
+    memcpy(s->sh_a_pipe, s->a_pipe, sizeof s->a_pipe);
+    memcpy(s->sh_dau_flag_pipe, s->dau_flag_pipe, sizeof s->dau_flag_pipe);
     s->sh_do_active = s->do_active; s->sh_do_lock = s->do_lock;
     s->sh_do_start = s->do_start;   s->sh_do_end = s->do_end;
     s->sh_do_count = s->do_count;
@@ -195,6 +199,9 @@ static void do_ireturn(dsp3210_emu *s)
         s->dauc = s->sh_dauc;
         s->ctr = s->sh_ctr;
         memcpy(s->a, s->sh_a, sizeof s->a);
+        memcpy(s->a_pipe, s->sh_a_pipe, sizeof s->a_pipe);
+        memcpy(s->dau_flag_pipe, s->sh_dau_flag_pipe,
+               sizeof s->dau_flag_pipe);
         s->do_active = s->sh_do_active; s->do_lock = s->sh_do_lock;
         s->do_start = s->sh_do_start;   s->do_end = s->sh_do_end;
         s->do_count = s->sh_do_count;
@@ -272,12 +279,16 @@ static int mem_read(dsp3210_emu *s, uint32_t addr, int size, uint32_t *out)
     if (s->read_fn) {
         *out = s->read_fn(s->hook_ctx, addr, size, &fault);
         if (fault) { take_error(s, DSP3210_VEC_BUSERR); return -1; }
+        if (!s->in_fetch)
+            da_shadow_overlay(s, addr, size, out);
         return 0;
     }
     if (raw_access(s, addr, size, out, 0)) {
         take_error(s, DSP3210_VEC_BUSERR);
         return -1;
     }
+    if (!s->in_fetch)
+        da_shadow_overlay(s, addr, size, out);
     return 0;
 }
 
@@ -301,6 +312,120 @@ static int mem_write(dsp3210_emu *s, uint32_t addr, int size, uint32_t val)
     return 0;
 }
 
+
+/* ------------------------------------------------------------------ */
+/* DA store shadow (Latency 1) [IM §4.4.2.1]                           */
+
+/* A DA memory write lands at the pipeline's fourth stage, so the value
+ * written is not readable *by the DSP itself* until four instructions
+ * later.  The write is committed to memory immediately (hosts, DMA and
+ * faults behave as before); a 4-entry shadow of the pre-write bytes
+ * overlays the DSP's own data reads while the window lasts.
+ * Instruction fetch is exempt, and so is hook-backed memory (see
+ * below) — an embedder that replaces the map models the latency, if it
+ * wants it, on its own side. */
+static int da_shadowed_write(dsp3210_emu *s, uint32_t addr, int size,
+                             uint32_t val)
+{
+    uint8_t old[4] = { 0, 0, 0, 0 };
+    uint32_t maddr = addr & ~(uint32_t)(size - 1);
+    int have_old, i, slot = 0;
+
+    /*
+     * Snapshot the pre-write bytes from the *aligned* address, which is
+     * where mem_write will land them, but hand mem_write the address as
+     * given: it owns the alignment rules, and pre-masking here would
+     * suppress the address error (vector 4) a misaligned DA store must
+     * raise.
+     *
+     * The snapshot reads the built-in map directly, so it cannot see
+     * hook-backed memory — and reading through the hook is not an
+     * option, since an MMIO read may have side effects.  When hooks are
+     * installed, skip the shadow entirely rather than overlay the
+     * DSP's reads with bytes from an array the embedder isn't using.
+     */
+    have_old = (s->read_fn == NULL && s->write_fn == NULL);
+    for (i = 0; have_old && i < size; i++) {
+        uint32_t b = 0;
+        if (raw_access(s, maddr + (uint32_t)i, 1, &b, 0))
+            have_old = 0;
+        old[i] = (uint8_t)b;
+    }
+    if (mem_write(s, addr, size, val))
+        return -1;
+    if (!have_old)
+        return 0;                      /* hook-backed or unmapped */
+    for (i = 0; i < 4; i++) {          /* free slot, else the oldest */
+        if (!s->da_wr[i].live) { slot = i; break; }
+        if (s->da_wr[i].rem < s->da_wr[slot].rem)
+            slot = i;
+    }
+    s->da_wr[slot].addr = maddr;
+    s->da_wr[slot].size = (uint8_t)size;
+    s->da_wr[slot].rem = 3;
+    s->da_wr[slot].live = 1;
+    memcpy(s->da_wr[slot].old, old, sizeof old);
+    return 0;
+}
+
+/* Overlay any byte still inside a store's three-instruction window with
+ * its pre-write value; when windows overlap, the OLDEST wins (the
+ * result is the memory content from before the whole window). */
+static void da_shadow_overlay(dsp3210_emu *s, uint32_t addr, int size,
+                              uint32_t *val)
+{
+    int big = (s->pcw >> 8) & 1;
+    int rem, e, i;
+    for (rem = 3; rem >= 0; rem--)             /* newest first, so the */
+        for (e = 0; e < 4; e++) {              /* oldest lands last    */
+            const struct dsp3210_da_wr *w = &s->da_wr[e];
+            if (!w->live || w->rem != rem)
+                continue;
+            for (i = 0; i < size; i++) {
+                uint32_t a = addr + (uint32_t)i;
+                if (a - w->addr < w->size) {
+                    int shift = 8 * (big ? size - 1 - i : i);
+                    *val = (*val & ~(0xFFu << shift))
+                         | ((uint32_t)w->old[a - w->addr] << shift);
+                }
+            }
+        }
+}
+
+/* ------------------------------------------------------------------ */
+/* pipeline/pin time base                                              */
+
+/* one unit of core time: each executed instruction (both the normal
+ * fetch path and the irsh replay) advances the DAU latency pipes and
+ * ages the DA store shadow */
+static void latency_tick(dsp3210_emu *s)
+{
+    int i;
+    memmove(s->a_pipe[1], s->a_pipe[0], 2 * sizeof s->a_pipe[0]);
+    memcpy(s->a_pipe[0], s->a, sizeof s->a);
+    memmove(&s->dau_flag_pipe[1], &s->dau_flag_pipe[0], 3);
+    s->dau_flag_pipe[0] = (uint8_t)((s->ps >> 4) & 0xFu);
+    for (i = 0; i < 4; i++)
+        if (s->da_wr[i].live) {
+            if (s->da_wr[i].rem == 0)
+                s->da_wr[i].live = 0;
+            else
+                s->da_wr[i].rem--;
+        }
+}
+
+/* derive the live ps.IR pin bits from the pulse counters (active-low
+ * pins: 1 = negated/idle) and burn one slot of pulse time */
+static void pin_tick(dsp3210_emu *s)
+{
+    int i;
+    s->ps = (uint16_t)((s->ps & ~(DSP3210_PS_IR0 | DSP3210_PS_IR1))
+          | (s->ext_pulse[0] ? 0 : DSP3210_PS_IR0)
+          | (s->ext_pulse[1] ? 0 : DSP3210_PS_IR1));
+    for (i = 0; i < 2; i++)
+        if (s->ext_pulse[i])
+            s->ext_pulse[i]--;
+}
 
 /* ------------------------------------------------------------------ */
 /* The DAU — one of two implementations (see the file header)          */
@@ -395,8 +520,12 @@ static int cond_eval(dsp3210_emu *s, unsigned c)
     unsigned ps = s->ps;
     unsigned n = !!(ps & DSP3210_PS_n), z = !!(ps & DSP3210_PS_z);
     unsigned v = !!(ps & DSP3210_PS_v), cf = !!(ps & DSP3210_PS_c);
-    unsigned AN = !!(ps & DSP3210_PS_N), AZ = !!(ps & DSP3210_PS_Z);
-    unsigned AU = !!(ps & DSP3210_PS_U), AV = !!(ps & DSP3210_PS_V);
+    /* DAU conditions test the flags established four instructions back
+     * (Latency 4) [IM §4.4.2.4]; ifalt/ifaeq/ifagt read the live flags
+     * and do not come through here */
+    unsigned dnzuv = s->dau_flag_pipe[3];
+    unsigned AN = (dnzuv >> 0) & 1, AZ = (dnzuv >> 1) & 1;
+    unsigned AU = (dnzuv >> 2) & 1, AV = (dnzuv >> 3) & 1;
 
     switch (c & 63) {
     case 0:  return 0;                 /* false */
@@ -468,6 +597,12 @@ static int ior_write(dsp3210_emu *s, unsigned n, uint32_t v, int size)
         break;
     case 8:
         s->emr = (uint16_t)v;
+        if (v & 1u)
+            /* hardware-verified: an emr write with bit 0 set drops a
+             * latched-but-untaken EXT1 request without taking it (the
+             * kernel's r=emr; emr=r|1; emr=r pulse); the pin level is
+             * unaffected */
+            s->pending &= (uint16_t)~(1u << DSP3210_VEC_EXT1);
         break;
     case 10:                           /* spc pseudo-register */
         return size == 1 ? SPC_SFTRST : size == 2 ? SPC_BKPT : SPC_WAITI;
@@ -910,6 +1045,9 @@ int dsp3210_step(dsp3210_emu *s)
     if (s->level == DSP3210_LVL_DERROR)
         return DSP3210_STEP_DERROR;
 
+    /* one slot of core time passes per step, executed or asleep */
+    pin_tick(s);
+
     if (s->waiting) {
         if (pending_vector(s)) {
             /* the instruction after waiti executes when the interrupt
@@ -917,6 +1055,10 @@ int dsp3210_step(dsp3210_emu *s)
             s->waiting = 0;
             s->int_defer = 1;
         } else {
+            /* time passes while asleep: the DAU pipeline keeps
+             * clocking, so stale accumulator/flag values settle and
+             * the DA store shadow drains during waiti */
+            latency_tick(s);
             return DSP3210_STEP_WAITI;
         }
     }
@@ -941,16 +1083,23 @@ int dsp3210_step(dsp3210_emu *s)
         s->cur_insn = addr;
         s->prefetch_addr = 1;          /* odd: never matches a pc */
         s->icount++;
+        latency_tick(s);
         st = exec_insn(s, w);
     } else {
         addr = s->pc;
         s->cur_insn = addr;
-        if (mem_read(s, addr, 4, &w))
+        s->in_fetch = 1;               /* fetch bypasses the DA store
+                                          shadow [IM §8.2.6] */
+        if (mem_read(s, addr, 4, &w)) {
+            s->in_fetch = 0;
             return DSP3210_STEP_OK;    /* fetch fault → exception taken */
+        }
+        s->in_fetch = 0;
 
         s->pc = s->npc;
         s->npc = s->pc + 4;
         s->icount++;
+        latency_tick(s);
 
         /* model the prefetch of the next instruction: it happens under
          * the memory map in force NOW, before this instruction's side
@@ -1011,6 +1160,18 @@ void dsp3210_reset(dsp3210_emu *s, unsigned straps)
     s->prefetch_addr = 1;
     s->last_vector = -1;
     s->cur_insn = 0;
+    memset(s->a_pipe, 0, sizeof s->a_pipe);
+    memset(s->dau_flag_pipe, 0, sizeof s->dau_flag_pipe);
+    memset(s->da_wr, 0, sizeof s->da_wr);
+    s->in_fetch = 0;
+    s->ext_pulse[0] = s->ext_pulse[1] = 0;
+    /* the EXT pins are active-low: idle pins read negated = 1 */
+    s->ps |= DSP3210_PS_IR0 | DSP3210_PS_IR1;
+    /* with no SIO modelled, the serial OUTPUT buffer is (vacuously)
+     * empty — obe tests "obe=1: output buffer empty" [IM cond table],
+     * so a never-written buffer must read empty, or a guest waiting
+     * `if (obe)` hangs.  IBF stays 0 (input buffer not full). */
+    s->ps |= DSP3210_PS_OBE;
 }
 
 void dsp3210_init(dsp3210_emu *s, uint8_t *mem, uint32_t mem_size)
@@ -1025,6 +1186,19 @@ void dsp3210_request_interrupt(dsp3210_emu *s, int vector)
 {
     if (vector >= 8 && vector <= 15)
         s->pending |= (uint16_t)(1u << vector);
+}
+
+void dsp3210_ext_pulse(dsp3210_emu *s, int vector, unsigned slots)
+{
+    int idx;
+    if (vector == DSP3210_VEC_EXT0)      idx = 0;
+    else if (vector == DSP3210_VEC_EXT1) idx = 1;
+    else                                 return;
+    s->pending |= (uint16_t)(1u << vector);
+    if (slots) {
+        s->ext_pulse[idx] = slots;
+        s->ps &= (uint16_t)~(idx ? DSP3210_PS_IR1 : DSP3210_PS_IR0);
+    }
 }
 
 int dsp3210_load(dsp3210_emu *s, uint32_t addr, const void *buf, size_t len)

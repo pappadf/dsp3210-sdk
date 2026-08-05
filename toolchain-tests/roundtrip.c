@@ -12,9 +12,10 @@
  *      every word the disassembler accepts cleanly (status OK and no
  *      '?' placeholder), the assembler must accept the text, and:
  *        - the re-assembled word w2 must disassemble to the *same
- *          text* (the architecture has aliases — e.g. two "no Z write"
- *          spellings, 6d subtract vs format-5 add — so w2 may differ
- *          from w, but never in meaning or spelling);
+ *          text* (the architecture has aliases — e.g. the two "no Z
+ *          write" spellings that coincide when Y is an accumulator,
+ *          6d subtract vs format-5 add — so w2 may differ from w, but
+ *          never in meaning or spelling);
  *        - w2 must be a fixed point: assembling its disassembly must
  *          give w2 again (the assembler is a canonicaliser);
  *        - branch class and resolved targets must be preserved.
@@ -128,6 +129,12 @@ static const char *const corpus[] = {
     "a0 = -(*r2++r16 = *r1) * *r8--",
     "a0 = -a1 + (*r2-- = *r3++r17) * *r1++",
     "a2 = 1.0 + (*r6 = a1) * a0", "a3 = -0.0 + (*r7++ = *r8) * *r9",
+    /* Z through the memory Y's own pointer (encodes as p=1111) */
+    "*r2++ = a2 = *r2 + a0", "*r1 = a0 = float32(*r1)",
+    "*r2++ = a0 = *r2 * a1", "*r8++ = a0 = *r8 + a1 * *r10++",
+    "*r4-- = a1 = -*r4++r18 * a3",
+    "a0 = (*r2++r16 = *r2++r15) + a0",
+    "a3 = a1 + (*r4++r15 = *r4++r15) * a0",
     "*r1 = a2 = *r2--", "*r1++ = a0 = a1 - *r2-- * *r3++r17",
     "*r2++r16 = a2 = *r14++ - a0 * *r10--",
     "*r2++r17 = a3 = *r12++ * *r11--", "*r4 = a1 = a1 + a2",
