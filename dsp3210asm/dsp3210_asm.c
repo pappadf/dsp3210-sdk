@@ -770,8 +770,27 @@ static unsigned da_operand(A *a)
 
 static int da_is_acc(unsigned field)   { return (field >> 3) == 0; }
 
-#define DA_NOWRITE 0x7Fu   /* Apple's assembler convention; the manual's
-                              examples use 0x07 — both mean "no Z write" */
+#define DA_NOWRITE 0x07u   /* p=0000, i=111 — the only true "no write".
+                              (p=1111 is NOT a no-write spelling: it is a
+                              store through the Y operand's own effective
+                              address; see da_z_canon.) */
+
+/*
+ * A Z memory operand addressed through the same pointer register as a
+ * memory Y operand encodes as p=1111: the hardware stores through Y's
+ * own effective address and the Z field's I bits post-modify Y's
+ * pointer register (hardware-verified; the manual's Table 10-3 calls
+ * p=1111 "not allowed", but shipped assembler output uses it for every
+ * in-place read-modify-write).  This is also how the disassembler
+ * renders those words, so the pair round-trips.
+ */
+static unsigned da_z_canon(unsigned z, unsigned y)
+{
+    unsigned zp = (z >> 3) & 15, yp = (y >> 3) & 15;
+    if (zp >= 1 && zp <= 14 && zp == yp)
+        return (15u << 3) | (z & 7u);
+    return z;
+}
 
 /* a parsed additive term of a DA expression */
 enum { D_OP, D_PROD, D_TAP, D_TAPPROD, D_ZERO, D_ONE, D_ZEROPROD };
@@ -830,6 +849,7 @@ static dterm da_term(A *a)
 static uint32_t da_word(unsigned fmt, unsigned m, unsigned fs, unsigned ss,
                         unsigned n, unsigned x, unsigned y, unsigned z)
 {
+    z = da_z_canon(z, y);
     return (fmt << 29) | (m << 26) | (fs << 24) | (ss << 23) | (n << 21)
          | (x << 14) | (y << 7) | z;
 }
@@ -863,7 +883,7 @@ static uint32_t enc_da(A *a, unsigned n, unsigned zpre, int have_z)
         need_p(a, ")");
         need_end(a);
         return (0x0Fu << 27) | (g << 23) | (n << 21) | (y << 7)
-             | (have_z ? zpre : DA_NOWRITE);
+             | da_z_canon(have_z ? zpre : DA_NOWRITE, y);
     }
 
     neg1 = eat_p(a, "-");

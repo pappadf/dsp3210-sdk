@@ -61,8 +61,12 @@ static void dump_regs(dsp3210_emu *s)
            "dauc %02x  ctr %02x\n",
            s->pc, s->pcsh, s->ps, s->emr, s->pcw, s->dauc, s->ctr);
     for (i = 0; i < 4; i++) {
-        /* pack the 40-bit fields to a 32-bit word (guard truncated) so
-         * the same line prints faithfully on either DAU */
+        /* pack the 40-bit fields to a 32-bit word (guard truncated).
+         * The two DAUs agree here to within the low mantissa bit: the
+         * approximate DAU carries a host double's full precision in the
+         * lane, while the exact DAU's accumulator holds a 24-bit
+         * mantissa with zero guard bits, so a value with more precision
+         * than the DSP32 format can hold may round differently. */
         int64_t mg = 0;
         int e = 0;
         dsp3210_acc_raw(s, i, &mg, &e);

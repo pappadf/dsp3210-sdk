@@ -87,11 +87,15 @@ illegal/reserved` with `ins.status` set accordingly.
 - **The 5-bit CAU register field is discontinuous** (IM Table 10-2):
   `0`=r0, `1-14`=r1-r14, `15`=pc, `17-21`=r15-r19, `22/23`=the `-n`/`+n`
   pseudo-operands, `24-26`=r20-r22, `30`=pcsh; 16, 27-29, 31 reserved.
-- **"No Z write" has two spellings.**  The manual's examples encode the
-  DA Z field's no-write marker as `0000111` (0x07), but the assembler
-  output shipped in real systems (Apple's Mac AV DSP code) uses
-  `1111111` (0x7F).  Both are accepted; since p=1111 cannot address
-  memory this is unambiguous.
+- **A DA Z field with p=1111 is a store through the Y operand.**  The
+  manual calls p=1111 "not allowed" and it was long misread as a second
+  spelling of "no write" (0x7F), but shipped code depends on the store:
+  the result goes through Y's own effective address and the Z field's
+  I bits post-modify Y's pointer register - rendered as, e.g.,
+  `*r2++ = a2 = *r2 + a0`.  With an accumulator Y there is nothing to
+  store through and the field decodes as no write (which is where the
+  misreading came from).  The true no-write marker is the manual's
+  `0000111` (0x07).
 - Two of the manual's worked examples contain typos (the OR example
   encodes r15 with the pc code; the SHIFT LEFT example shows the `>>`
   F-code).  The chapter 10 tables - corroborated by the manual's own

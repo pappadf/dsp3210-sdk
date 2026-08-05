@@ -256,8 +256,10 @@ int main(void)
 
     /* ---- DA multiply/accumulate — IM chapter 4.6 examples.
      * Words with a real Z store match the manual bit for bit; "no
-     * write" forms canonicalise to Z = 0x7F (Apple's convention), so
-     * the manual's 0x07 words are covered by the roundtrip form. ---- */
+     * write" is the manual's 0x07.  A Z operand through the same
+     * pointer as a memory Y encodes as p=1111 — the store through Y's
+     * effective address (hardware-verified; the old reading of 0x7F as
+     * a second no-write spelling was wrong). ---- */
     expect_word("*r1 = a2 = *r2--",
                 (1u<<29)|(4u<<26)|(2u<<21)|(0x16u<<7)|0x08u);
     expect_word("*r1++ = a0 = a1 - *r2-- * *r3++r17",
@@ -270,8 +272,15 @@ int main(void)
                 (3u<<29)|(4u<<26)|(3u<<21)|(0x5Eu<<14)|(0x67u<<7)|0x13u);
     expect_word("a0 = -(*r2++r16 = *r1) * *r8--",
                 (2u<<29)|(4u<<26)|(1u<<23)|(0x46u<<14)|(0x08u<<7)|0x12u);
-    /* Apple's assembler output (no Z write encoded as 0x7F) */
-    expect_word("a2 = *r2 + a0",              0x3440087Fu);
+    /* Z through Y's own pointer -> p=1111 (shipped assembler output) */
+    expect_word("*r2++ = a2 = *r2 + a0",      0x3440087Fu);
+    expect_word("*r1 = a0 = float32(*r1)",    0x7C000478u);
+    expect_word("*r2++ = a0 = *r2 * a1",      0x7000487Fu);
+    expect_word("*r8++ = a0 = *r8 + a1 * *r10++", 0x2415E07Fu);
+    expect_word("a0 = (*r2++r16 = *r2++r15) + a0", 0x380008FAu);
+    expect_word("a3 = a1 + (*r4++r15 = *r4++r15) * a0", 0x446010F9u);
+    /* plain no-write forms now canonicalise to the manual's 0x07 */
+    expect_word("a2 = *r2 + a0",              0x34400807u);
     expect_word("a0 = (*r3++ = *r1++) + a0",  0x3800079Fu);
     expect_rt  ("a1 = *r5-- - *r7++");
     expect_rt  ("a1 = (*r13 = a3) - *r1--");

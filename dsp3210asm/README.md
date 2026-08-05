@@ -104,7 +104,8 @@ assemble∘disassemble); the notable choices:
 | DA `aN = Y + X` | format 1 with M = 1.0 | format 1 M = 110 (tap) without a Z write |
 | DA `aN = aM ± Y * X` | format 3 | format 2 without a Z write |
 | DA `aN = Y ± aM * X`, all-accumulator operands | format 1 | format 3 |
-| DA "no Z write" | `1111111` (0x7F - Apple's assembler convention) | the manual's `0000111` |
+| DA "no Z write" | the manual's `0000111` (0x07) | - (0x7F is NOT a no-write spelling: it is the store-through-Y encoding, see below) |
+| DA Z operand through the same pointer as a memory Y (`*r2++ = a2 = *r2 + a0`) | p = `1111`: the store goes through Y's own effective address, Z's I bits post-modifying Y's pointer (hardware-verified; shipped assembler output) | a normal Z field with the same base register (only distinguishable when Y post-modifies - an assembler-rejected construct) |
 
 `do K, N` writes the raw field values, matching the disassembler (the
 hardware executes K+1 instructions N+1 times).

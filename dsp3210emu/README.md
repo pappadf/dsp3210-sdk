@@ -27,7 +27,7 @@ Makefile compiles the core twice:
 | `libdsp3210emu-exact.a`, `dsp3210emu-exact` (`-DDSP3210_DAU_EXACT`) | **exact** (`dsp3210_dau_exact.inc`): the datapath in integers - 40-bit accumulators, exact 25×25-bit multiplier, truncating adder, documented rounding/saturation.  No host floating point in the data path. | when guard bits, exact rounding or saturation corner cases matter |
 
 Both cores share this header and the same ABI (the accumulator slot is a
-union; use the `dsp3210_acc_*` accessors), pass the same 31-test suite,
+union; use the `dsp3210_acc_*` accessors), pass the same 41-test suite,
 and run every program in `../toolchain-tests` identically.  Where they
 were ever observed to differ (a 157-probe DAU comparison during
 development: 10 corner-case probes), the exact DAU matched the
@@ -41,7 +41,7 @@ documented hardware behaviour in all of them.
 | `dsp3210_dau_double.inc` | the approximate DAU (included by the core; not compiled alone) |
 | `dsp3210_dau_exact.inc` | the exact DAU (included by the core; not compiled alone) |
 | `dsp3210emu.c` | command-line driver (links `../dsp3210dis` for tracing) |
-| `test_dsp3210_emu.c` | 31 unit tests: hand-encoded programs covering every instruction family, the exception model, and the DSP32 float codec - run against **both** DAUs |
+| `test_dsp3210_emu.c` | 41 unit tests: hand-encoded programs covering every instruction family, the exception model, and the DSP32 float codec - run against **both** DAUs |
 | `Makefile` | `make` builds both libraries, both CLIs and both test binaries; `make test` runs the suite on both |
 
 ## What is (and isn't) implemented - version 1
@@ -98,13 +98,46 @@ boot ROM's SAR path runs across that switch).
 Endianness follows `pcw[8]` (big-endian by default, as on the AV Macs).
 Optional read/write hooks let an embedder replace the whole map.
 
-**Not modelled (deliberately, v1):** pipeline latencies and the
-assembler-enforced restrictions of IM §4.4 (everything behaves as if all
-latencies were zero); the SIO, DMA controller, timer and BIO peripherals
+**DAU pipeline latencies ARE modelled** [IM §4.4.2] - shipped DSP code
+is software-pipelined against them, so a zero-latency model computes
+wrong answers on real workloads:
+
+- *Latency 1*: a DA memory write is not readable by the DSP itself for
+  three further instructions (a 4-entry pre-write shadow overlays the
+  core's own data reads; memory commits immediately, so hosts, DMA and
+  instruction fetch are unaffected).  The shadow covers the built-in
+  memory map only: setting the read/write hooks disables it, because
+  the core cannot snapshot an embedder's memory without risking MMIO
+  read side effects - model this latency host-side if you replace the
+  map;
+- *Latency 2*: an accumulator feeding the multiplier reads the value
+  established three instructions back (a 3-deep accumulator-file pipe;
+  adder inputs read live);
+- *Latency 4*: DAU conditions tested by branches/conditional ALU ops
+  are the flags from four instructions back (a 4-deep flag pipe;
+  `ifalt`/`ifaeq`/`ifagt` stay zero-latency per the manual).
+
+Both pipes are part of the interrupt context save/restore, settle
+during waiti sleep (time passes while asleep), and are flushed by
+`dsp3210_acc_set` so host pokes act instantly.
+
+**External interrupt pins:** `ps.IR0/IR1` mirror the live (active-low)
+EXT pin levels - idle pins read *set*, from reset on - and `ps.OBE`
+reads set (with no SIO modelled the serial output buffer is vacuously
+empty, so a guest waiting to send must not hang).
+`dsp3210_ext_pulse(s, vector, slots)` latches the interrupt request and
+asserts the pin for `slots` units of core time (executed instructions
+and waiti sleep steps), for guest code that polls the pin level; an
+`emr` write with bit 0 set drops a latched-but-untaken EXT1 request
+(hardware-verified kernel behaviour).
+
+**Not modelled (deliberately, v1):** the assembler-enforced sequence
+restrictions of IM §4.4.1 (no shipped code contains them); the SIO, DMA
+controller, timer and BIO peripherals
 (their MMIO words are plain RAM); bus arbitration.  Interrupts are
 recognised only at instruction boundaries and never in the shadow of a
 *taken* delayed branch.  (The IM makes all branch instructions, and
-loads, non-interruptible for one cycle; in a zero-latency model the
+loads, non-interruptible for one cycle; at instruction granularity the
 architectural result is the same either way, so only the taken-branch
 window is modelled.)  The `irsh` instruction-shadow replay **is**
 modelled explicitly - `ireturn` re-executes the word prefetched before
@@ -127,14 +160,18 @@ Specific to the **approximate DAU** (the exact DAU gets these right):
 
 Common to both DAUs:
 
-- `oc`, `int16`, `int32` and `ieee`, whose hardware result is a raw bit
-  pattern parked in accumulator bit positions ("the lower portion
-  contains unpredictable data"), leave the *numeric* result in `aN`
-  instead.  Their Z memory writes - which the manual requires to be
-  issued in the same instruction anyway - carry the correct bits.
-- Special-function operands taken *from an accumulator* use the numeric
-  value (so `float16(aN)` after `aN = int16(...)` composes as expected);
-  `dsp(aN)` is undefined by the manual (Y may not be an accumulator).
+- **The integer conversions deposit their result in the accumulator's
+  integer lane**: `int32` fills the mantissa+guard bits (39-8), `int16`
+  the upper 16, `oc` the top byte - only the exponent is unpredictable
+  per the manual, and this core keeps the adder input's.  `ic`,
+  `float16` and `float32` read the same lanes, so `float32(int32(x))`
+  is the defined round trip shipped code uses (a phase accumulator
+  split into integer and fractional parts).  The approximate DAU
+  synthesises the lane from its double at full 31-fraction-bit
+  precision.  `ieee` still leaves the numeric value (its page has no
+  "unpredictable" language and no shipped read-back exists to pin it -
+  the one remaining accumulator-content deviation).
+- `dsp(aN)` is undefined by the manual (Y may not be an accumulator).
 - Reserved encodings (ALU F=0101, W sizes 101/110, reserved register/IO/
   condition/G codes) execute as benign no-ops or zero-reads; only the
   seven architected illegal opcodes raise an error.  Reserved W sizes
@@ -274,7 +311,7 @@ level base  insns 120
 
 ## Validation
 
-`make test` runs the 31-test suite twice - once per DAU (the test
+`make test` runs the 41-test suite twice - once per DAU (the test
 source is shared and uses only the uniform accessors).  Notable
 oracles:
 

@@ -9,10 +9,10 @@ AT&T Information Manual.
 
 ```
 $ make test
-corpus: 216 statements round-tripped
-fuzz: 12327944 clean decodes re-assembled (2908005 aliases canonicalised)
+corpus: 223 statements round-tripped
+fuzz: 12522763 clean decodes re-assembled (3138351 aliases canonicalised)
 programs: 7 image(s) round-tripped
-12328167 checks, 0 failures
+12522993 checks, 0 failures
 ok   apps/bitops.s (32 insns, 10 checks)
 …                                     (run_apps: the approximate DAU)
 7 programs, 0 failures
@@ -24,21 +24,22 @@ ok   apps/bitops.s (32 insns, 10 checks)
 
 Three layers, weakest to strongest:
 
-1. **Corpus.** ~216 statements, at least one per syntax form.  Each
+1. **Corpus.** ~223 statements, at least one per syntax form.  Each
    must survive text → word → text unchanged, and re-assembling the
    disassembly must reproduce the word bit for bit.
 
 2. **Sweep + fuzz.**  For all 64 opcodes, every value of the low
    halfword and of the mid halfword (with the other bits both clean
-   and dirty), plus four million xorshift words - ~12.3 M words that
+   and dirty), plus four million xorshift words - ~12.5 M words that
    disassemble cleanly (status OK, no `?` placeholder).  For each:
    the assembler must accept the text; the re-assembled word must
    disassemble to the *identical text* with identical branch class and
    resolved target; and it must be a fixed point of
    assemble∘disassemble.  Words may legitimately change - the
-   architecture has ~2.9 M aliases in this set (two "no Z write"
-   spellings, subtract-vs-add-of-negative, format 5 vs 6d, 8a vs 1b…) -
-   but meaning and spelling may not.
+   architecture has ~3.1 M aliases in this set (the two "no Z write"
+   spellings that coincide when Y is an accumulator,
+   subtract-vs-add-of-negative, format 5 vs 6d, 8a vs 1b…) - but
+   meaning and spelling may not.
 
 3. **Programs.**  Every app below is assembled, its image disassembled
    into a complete source (words that don't decode cleanly become
@@ -72,17 +73,29 @@ traces each instruction through the disassembler.  New tests are new
 | `sum.s` | do-loops (3b), post-incremented loads, register adds, direct stores |
 | `fib.s` | the 3a loop branch, delayed branches, register moves - fib(20) = 0x1a6d |
 | `memcpy.s` | `(byte)` moves post-increment by 1, both loop kinds; copies and reverses a 16-byte string |
-| `bitops.s` | the whole ALU: shifts, rotates, `&~`/`^`/`|`/`#`, compare + conditional increment, reverse subtract, `sp = sp±±` moving by 4 |
+| `bitops.s` | the whole ALU: shifts, rotates, `&~`/`^`/`\|`/`#`, compare + conditional increment, reverse subtract, `sp = sp±±` moving by 4 |
 | `calls.s` | nested call/return on distinct link registers, delay slots, a software stack on r21 - factorial by repeated-addition multiply |
 | `floats.s` | DA MACs in a do-loop, `.float` DSP32 data, Z-field stores, `int32`/`float32` - an exact dot product (6.5) |
 | `irq.s` | evtp vector dispatch, emr, waiti's latent instruction, ireturn's instruction-shadow replay (the loop only exits if the replay happens) |
 
 ## Findings
 
-No emulator bugs were found by this suite - both DAUs agree with each
-other and with the manual on everything the apps exercise.  Two
-behaviours that *look* like bugs and are not, recorded here so the next
-reader doesn't re-investigate:
+This suite reports no disagreement: both DAUs agree with each other and
+with the manual on everything the apps exercise, and the assembler and
+disassembler agree over the whole cleanly-decodable opcode space.
+
+Read that as a limit of the method rather than a clean bill of health.
+The DA Z store-through-Y encoding, the three DAU pipeline latencies,
+the live EXT pin levels and the integer lane the `int`/`oc` conversions
+leave behind were all modelled wrongly while this suite passed, and
+none of them was found here.  What found them was running *shipped
+vendor software*: a toolchain checked only against itself can be
+consistently wrong, and only foreign code breaks that symmetry.  All
+are now modelled, and pinned by the emulator's own unit tests - see
+[`../dsp3210emu/README.md`](../dsp3210emu/README.md).
+
+Two behaviours that *look* like bugs and are not, recorded here so the
+next reader doesn't re-investigate:
 
 - **Format-7a direct addresses land in the on-chip window.**
   `*0x400 = r2` in processor mode writes 0x50030400, not flat 0x400
@@ -91,7 +104,7 @@ reader doesn't re-investigate:
 - **`int32()`/`int16()` round, they don't truncate.**  dauc resets to
   round-to-nearest-ties-up [IM Table 8-3], so `int32(6.5)` is 7.
 
-One assembler-level pitfall the hard way: an **immediate compare
+One assembler-level pitfall learned the hard way: an **immediate compare
 sign-extends its 16-bit operand** (`r7 - 0xd007` compares against
 0xffffd007), so `bitops.s` compares against a `(ushort24)`-loaded
 register instead.

@@ -101,7 +101,7 @@ loops, subroutine calls, DAU multiply-accumulate and interrupt handling.
 
 - each tool has its own unit suite (`make test` in each directory);
 - `toolchain-tests/roundtrip` proves assembler and disassembler agree
-  over the entire cleanly-decodable opcode space (~12.3 M words:
+  over the entire cleanly-decodable opcode space (~12.5 M words:
   per-opcode exhaustive halfword sweeps plus a deterministic random
   stream) - every decode re-assembles to the identical text, and the
   assembler's output is a fixed point;

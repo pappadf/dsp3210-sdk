@@ -683,29 +683,81 @@ static void test_da_int_float(void)
     dsp3210_peek(&S, 0x104, 2, &v);
     CHECK(v == 0xFFFB);                         /* halfword Z write */
 
-    /* int32 saturation + rounding modes */
+    /* int32 saturation + rounding modes.  int32 deposits a raw
+     * integer in the accumulator's LANE, so the defined
+     * way to observe it is the float32 round trip. */
     const uint32_t q[] = {
         e_daspec(9, 0, DF_ACC(1), DF_NOWR),     /* a0 = int32(a1) */
+        e_daspec(8, 2, DF_ACC(0), DF_NOWR),     /* a2 = float32(a0) */
     };
-    prog(q, 1);
+    prog(q, 2);
     dsp3210_acc_set(&S, 1, 1e30);
-    steps(1);
-    CHECK(dsp3210_acc_get(&S, 0) == 2147483647.0);              /* saturated */
+    steps(2);
+    CHECK(dsp3210_acc_get(&S, 2) == 2147483647.0);              /* saturated */
 
-    prog(q, 1);
+    prog(q, 2);
     dsp3210_acc_set(&S, 1, -2.5);
-    steps(1);
-    CHECK(dsp3210_acc_get(&S, 0) == -2.0);                      /* nearest, ties up */
-    prog(q, 1);
+    steps(2);
+    CHECK(dsp3210_acc_get(&S, 2) == -2.0);                      /* nearest, ties up */
+    prog(q, 2);
     S.dauc = 1u << 4;                           /* truncate to -inf */
     dsp3210_acc_set(&S, 1, -2.5);
-    steps(1);
-    CHECK(dsp3210_acc_get(&S, 0) == -3.0);
-    prog(q, 1);
+    steps(2);
+    CHECK(dsp3210_acc_get(&S, 2) == -3.0);
+    prog(q, 2);
     S.dauc = 3u << 4;                           /* truncate to 0 */
     dsp3210_acc_set(&S, 1, -2.5);
-    steps(1);
-    CHECK(dsp3210_acc_get(&S, 0) == -2.0);
+    steps(2);
+    CHECK(dsp3210_acc_get(&S, 2) == -2.0);
+}
+
+static void test_da_int_lane(void)
+{
+    /* [IM INT32/INT16/OC pages] the integer conversions
+     * deposit a RAW INTEGER in the accumulator's mantissa+guard lane
+     * (int32: bits 39-8; int16: the upper 16; oc: the MSB) — only the
+     * exponent is unpredictable — and ic/float16/float32 read the same
+     * lanes.  Shipped code splits a phase accumulator with exactly
+     * this round trip:
+     *   *r8 = a0 = int32(a3) ; a0 = float32(a0) ; a0 = -a0 + a3
+     */
+    const uint32_t p[] = {
+        e_set24(RC(8), 0x100),
+        e_daspec(9, 0, DF_ACC(3), DF(8, 0)),    /* *r8 = a0 = int32(a3) */
+        e_daspec(8, 0, DF_ACC(0), DF_NOWR),     /* a0 = float32(a0) */
+        e_damac(1, 4, 1, 0, 0, 0, DF_ACC(0), DF_NOWR), /* a0 = -a0 (tmp) */
+        e_damac(1, 5, 0, 0, 0, DF_ACC(3), DF_ACC(0), DF_NOWR),
+                                                /* a0 = a0 + a3 = frac */
+    };
+    prog(p, 5);
+    S.dauc = 3u << 4;                           /* truncate toward 0 */
+    dsp3210_acc_set(&S, 3, 56.75);
+    steps(5);
+    uint32_t v;
+    dsp3210_peek(&S, 0x100, 4, &v);
+    CHECK(v == 56);                             /* Z write: the integer */
+    CHECK(fabs(dsp3210_acc_get(&S, 0) - 0.75) < 1e-6);  /* frac part */
+
+    /* int16 -> float16 round trip through the lane's upper 16 bits */
+    const uint32_t q[] = {
+        e_daspec(3, 1, DF_ACC(3), DF_NOWR),     /* a1 = int16(a3) */
+        e_daspec(2, 2, DF_ACC(1), DF_NOWR),     /* a2 = float16(a1) */
+    };
+    prog(q, 2);
+    dsp3210_acc_set(&S, 3, -123.4);
+    steps(2);
+    CHECK(dsp3210_acc_get(&S, 2) == -123.0);
+
+    /* oc -> ic round trip through the lane's top byte (unsigned) */
+    const uint32_t r[] = {
+        e_daspec(1, 1, DF_ACC(3), DF_NOWR),     /* a1 = oc(a3) */
+        e_daspec(0, 2, DF_ACC(1), DF_NOWR),     /* a2 = ic(a1) */
+    };
+    prog(r, 2);
+    S.dauc = 0x0F;                              /* unsigned linear both */
+    dsp3210_acc_set(&S, 3, 200.0);
+    steps(2);
+    CHECK(dsp3210_acc_get(&S, 2) == 200.0);
 }
 
 static void test_da_ieee_dsp(void)
@@ -836,6 +888,329 @@ static void test_dsp32_format(void)
     }
 }
 
+
+/* ---- hardware-verified corrections found against shipped code ---- */
+
+static void test_da_store_thru_y(void)
+{
+    /* Z with p=1111 stores through the Y operand's own effective
+     * address; Z's I bits post-modify Y's pointer.  The shipped
+     * in-place int->float convert: *r1 = a0 = float32(*r1). */
+    {
+        const uint32_t p[] = {
+            e_set24(RC(1), 0x100),
+            e_daspec(8 /* float32 */, 0, DF(1, 0), DF(15, 0)),
+        };
+        prog(p, 2);
+        dsp3210_poke(&S, 0x100, 4, 240);        /* a raw integer */
+        steps(2);
+        CHECK(fabs(dsp3210_acc_get(&S, 0) - 240.0) < 1e-9);
+        uint32_t v;
+        dsp3210_peek(&S, 0x100, 4, &v);
+        CHECK(v == dsp3210_double_to_dsp32(240.0));   /* written back */
+        CHECK(S.r[1] == 0x100);                 /* Z i=000: no advance */
+    }
+    /* MAC form with post-increment: *r2++ = a2 = *r2 + a0 (0x3440087F) */
+    {
+        const uint32_t p[] = {
+            e_set24(RC(2), 0x200),
+            e_damac(1, 5, 0, 0, 2, DF_ACC(0), DF(2, 0), DF(15, 7)),
+        };
+        prog(p, 2);
+        dsp3210_poke(&S, 0x200, 4, dsp3210_double_to_dsp32(2.5));
+        dsp3210_acc_set(&S, 0, 10.0);
+        steps(2);
+        CHECK(fabs(dsp3210_acc_get(&S, 2) - 12.5) < 1e-6);
+        uint32_t v;
+        dsp3210_peek(&S, 0x200, 4, &v);
+        CHECK(v == dsp3210_double_to_dsp32(12.5));    /* in-place RMW */
+        CHECK(S.r[2] == 0x204);                 /* Z i=111 advances Y's rP */
+    }
+    /* accumulator Y: p=1111 stores nothing, modifies nothing */
+    {
+        const uint32_t p[] = {
+            e_set24(RC(2), 0x200),
+            e_damac(3, 4, 0, 0, 0, DF_ACC(1), DF_ACC(1), 0x7F),
+        };
+        prog(p, 2);
+        dsp3210_poke(&S, 0x200, 4, 0x11223344u);
+        dsp3210_acc_set(&S, 1, 3.0);
+        steps(2);
+        CHECK(fabs(dsp3210_acc_get(&S, 0) - 9.0) < 1e-6);
+        uint32_t v;
+        dsp3210_peek(&S, 0x200, 4, &v);
+        CHECK(v == 0x11223344u);                /* untouched */
+        CHECK(S.r[2] == 0x200);
+    }
+}
+
+static void test_da_mult_latency(void)
+{
+    /* [IM §4.4.2.2] Latency 2, the manual's own example:
+     *   I1  a0 = a0 + *r1 * *r2
+     *   I2  a0 = a0 + a1
+     *   I3  nop
+     *   I4  a2 = a0 * a0      <- multiplier: uses the a0 from I1 (7)
+     *   I5  a1 = a2 + a0      <- adder a2 is live (I4); X=a0 from I2 */
+    const uint32_t p[] = {
+        e_set24(RC(1), 0x100),
+        e_set24(RC(2), 0x104),
+        e_damac(3, 0, 0, 0, 0, DF(2, 0), DF(1, 0), DF_NOWR),   /* I1 */
+        e_damac(1, 5, 0, 0, 0, DF_ACC(1), DF_ACC(0), DF_NOWR), /* I2 */
+        E_NOP,                                                 /* I3 */
+        e_damac(3, 4, 0, 0, 2, DF_ACC(0), DF_ACC(0), DF_NOWR), /* I4 */
+        e_damac(1, 5, 0, 0, 1, DF_ACC(0), DF_ACC(2), DF_NOWR), /* I5 */
+    };
+    prog(p, 7);
+    dsp3210_poke(&S, 0x100, 4, dsp3210_double_to_dsp32(2.0));
+    dsp3210_poke(&S, 0x104, 4, dsp3210_double_to_dsp32(3.0));
+    dsp3210_acc_set(&S, 0, 1.0);
+    dsp3210_acc_set(&S, 1, 10.0);
+    steps(7);
+    /* I1: a0 = 1 + 6 = 7; I2: a0 = 7 + 10 = 17;
+     * I4: a2 = 7 * 7 = 49 (NOT 17*17 = 289);
+     * I5: a1 = 49 + 17 = 66 (adder lane live, X three back) */
+    CHECK(fabs(dsp3210_acc_get(&S, 2) - 49.0) < 1e-6);
+    CHECK(fabs(dsp3210_acc_get(&S, 1) - 66.0) < 1e-6);
+    CHECK(fabs(dsp3210_acc_get(&S, 0) - 17.0) < 1e-6);
+}
+
+static void test_da_write_latency(void)
+{
+    /* [IM §4.4.2.1] Latency 1, the manual's own example:
+     *   I1  *r3 = a0 = a0
+     *   I2  *r3 = a3 = a3
+     *   I3, I4  nop
+     *   I5  a1 = *r3          <- reads the value written in I1, not I2 */
+    const uint32_t p[] = {
+        e_set24(RC(3), 0x100),
+        e_damac(1, 4, 0, 0, 0, 0, DF_ACC(0), DF(3, 0)),        /* I1 */
+        e_damac(1, 4, 0, 0, 3, 0, DF_ACC(3), DF(3, 0)),        /* I2 */
+        E_NOP, E_NOP,                                          /* I3 I4 */
+        e_damac(1, 4, 0, 0, 1, 0, DF(3, 0), DF_NOWR),          /* I5 */
+        e_mvind(0, W_LONG, RC(7), RC(3), 0),   /* I6: CA read, window over */
+    };
+    prog(p, 7);
+    dsp3210_poke(&S, 0x100, 4, dsp3210_double_to_dsp32(9.0));
+    dsp3210_acc_set(&S, 0, 1.5);
+    dsp3210_acc_set(&S, 3, 2.5);
+    steps(6);
+    CHECK(fabs(dsp3210_acc_get(&S, 1) - 1.5) < 1e-6);   /* I1's value */
+    uint32_t v;
+    dsp3210_peek(&S, 0x100, 4, &v);                     /* host: committed */
+    CHECK(v == dsp3210_double_to_dsp32(2.5));
+    steps(1);                                           /* I6: shadow gone */
+    CHECK(S.r[7] == dsp3210_double_to_dsp32(2.5));
+}
+
+static void test_da_cond_latency(void)
+{
+    /* [IM §4.4.2.4] Latency 4: a DAU condition tested by a branch or
+     * conditional ALU op is the one established four instructions
+     * back; ifalt/ifaeq/ifagt stay zero-latency. */
+    enum { C_AGT = 24, C_ALT = 19 };
+    const uint32_t p[] = {
+        e_damac(1, 4, 0, 0, 0, 0, DF_ACC(1), DF_NOWR),  /* I1: a0=a1 (+) */
+        e_damac(1, 4, 0, 0, 0, 0, DF_ACC(2), DF_NOWR),  /* I2: a0=a2 (-) */
+        E_NOP, E_NOP,                                   /* I3 I4 */
+        e_alur(1, F_ADD, RC(7), RC(0), C_AGT, RC_PLUS), /* I5: if(agt) r7=1 */
+        e_alur(1, F_ADD, RC(8), RC(0), C_ALT, RC_PLUS), /* I6: if(alt) r8=1 */
+    };
+    prog(p, 6);
+    dsp3210_acc_set(&S, 1, 5.0);                        /* agt after I1 */
+    dsp3210_acc_set(&S, 2, -3.0);                       /* alt after I2 */
+    steps(6);
+    /* I5 tests the flags established at I1 (agt) -> taken.
+     * I6 tests the flags established at I2 (alt) -> taken. */
+    CHECK(S.r[7] == 1);
+    CHECK(S.r[8] == 1);
+
+    /* ifalt reads the LIVE flags: immediately after a negative result */
+    const uint32_t q[] = {
+        e_damac(1, 4, 0, 0, 0, 0, DF_ACC(2), DF_NOWR),  /* a0 = a2 (< 0) */
+        e_daspec(5 /* ifalt */, 3, DF_ACC(1), DF_NOWR), /* a3 = ifalt(a1) */
+    };
+    prog(q, 2);
+    dsp3210_acc_set(&S, 1, 7.0);
+    dsp3210_acc_set(&S, 2, -3.0);
+    dsp3210_acc_set(&S, 3, 0.0);
+    steps(2);
+    CHECK(fabs(dsp3210_acc_get(&S, 3) - 7.0) < 1e-6);
+}
+
+static void test_ext_pin(void)
+{
+    /* ps.IR0/IR1 mirror the live (active-low) pin level: idle pins
+     * read SET, including right after reset. */
+    enum { C_IR1S = 47 };
+    const uint32_t p[] = {
+        e_alur(1, F_ADD, RC(7), RC(0), C_IR1S, RC_PLUS),/* if(ir1s) r7=1 */
+        E_NOP, E_NOP, E_NOP,
+        e_alur(1, F_ADD, RC(8), RC(0), C_IR1S, RC_PLUS),/* if(ir1s) r8=1 */
+    };
+    prog(p, 5);
+    CHECK((S.ps & DSP3210_PS_IR0) != 0);
+    CHECK((S.ps & DSP3210_PS_IR1) != 0);
+    steps(1);
+    CHECK(S.r[7] == 1);                 /* idle pin: ir1s is true */
+    /* assert the pin for 3 slots: the request latches, and the guest
+     * sees the pin asserted (ir1s false) for exactly those slots */
+    dsp3210_ext_pulse(&S, DSP3210_VEC_EXT1, 3);
+    CHECK((S.pending & (1u << 15)) != 0);
+    steps(3);                           /* I2-I4 run inside the pulse */
+    CHECK((S.ps & DSP3210_PS_IR1) == 0);/* still asserted during I4 */
+    steps(1);                           /* I5: pulse expired */
+    CHECK(S.r[8] == 1);                 /* ir1s true again at I5 */
+    CHECK((S.ps & DSP3210_PS_IR1) != 0);
+
+    /* an emr write with bit 0 set drops a latched-but-untaken EXT1
+     * request without taking it */
+    const uint32_t q[] = {
+        e_add3(1, RC(1), RC(0), 1),                    /* r1 = 1 */
+        e_mvior(1, W_SHORT, RC(1), 8),                 /* emr = r1 */
+        e_set24(RC(2), 0x8000),
+        e_mvior(1, W_SHORT, RC(2), 8),                 /* emr = 0x8000 */
+        E_NOP, E_NOP,
+    };
+    prog(q, 6);
+    dsp3210_request_interrupt(&S, DSP3210_VEC_EXT1);
+    CHECK((S.pending & (1u << 15)) != 0);
+    steps(6);
+    CHECK((S.pending & (1u << 15)) == 0);   /* dropped, not taken */
+    CHECK(S.level == DSP3210_LVL_BASE);
+    CHECK(S.last_vector == -1);             /* never dispatched */
+}
+
+static void test_sio_obe_idle(void)
+{
+    /* With no SIO modelled the serial output buffer is vacuously
+     * empty: obe ("obe=1, output buffer empty") must read true from
+     * reset, or a guest waiting to send hangs forever. */
+    enum { C_OBE = 35 };
+    const uint32_t p[] = {
+        e_alur(1, F_ADD, RC(9), RC(0), C_OBE, RC_PLUS), /* if(obe) r9=1 */
+    };
+    prog(p, 1);
+    CHECK((S.ps & DSP3210_PS_OBE) != 0);
+    steps(1);
+    CHECK(S.r[9] == 1);
+}
+
+static void test_latency_settles_in_waiti(void)
+{
+    /* Core time passes while asleep: the DAU pipeline keeps clocking,
+     * so a value written just before waiti is fully established by the
+     * time an interrupt wakes the core. */
+    const uint32_t p[] = {
+        e_set24(RC(22), 0x100),                        /* evtp = 0x100 */
+        e_set24(RC(1), 0x8000),
+        e_mvior(1, W_SHORT, RC(1), 8),                 /* emr = 0x8000 */
+        e_damac(1, 4, 0, 0, 0, 0, DF_ACC(1), DF_NOWR), /* a0 = a1 (=3) */
+        0x9DE0040Au,                                   /* waiti */
+        E_NOP,                                         /* latent */
+        e_damac(3, 4, 0, 0, 2, DF_ACC(0), DF_ACC(0), DF_NOWR),
+                                                       /* a2 = a0 * a0 */
+        0x9D60040Au,                                   /* bkpt */
+    };
+    int i, st = 0;
+    prog(p, 8);
+    dsp3210_acc_set(&S, 1, 3.0);
+    /* vector 15 (EXT1) quick slot at evtp + 0x78: just ireturn */
+    dsp3210_poke(&S, 0x178, 4, E_IRETURN);
+    for (i = 0; i < 64 && st != DSP3210_STEP_WAITI; i++)
+        st = dsp3210_step(&S);
+    CHECK(st == DSP3210_STEP_WAITI);
+    for (i = 0; i < 5; i++)                            /* sleep slots */
+        CHECK(dsp3210_step(&S) == DSP3210_STEP_WAITI);
+    dsp3210_ext_pulse(&S, DSP3210_VEC_EXT1, 2);
+    for (i = 0; i < 64; i++)
+        if (dsp3210_step(&S) == DSP3210_STEP_BKPT)
+            break;
+    /* the multiplier must see the SETTLED a0 = 3, not a stale 0 */
+    CHECK(fabs(dsp3210_acc_get(&S, 2) - 9.0) < 1e-6);
+}
+
+/* The Latency-1 store shadow must not swallow the address error a
+ * misaligned DA store raises, and must not fabricate shadow bytes for
+ * memory the embedder has taken over with hooks. */
+
+static void test_da_store_misaligned_raises_aerr(void)
+{
+    const uint32_t p[] = {
+        e_set24(RC(3), 0x102),                          /* misaligned! */
+        e_damac(1, 5, 0, 0, 0, DF_ACC(1), DF_ACC(0), DF(3, 0)),
+                                                /* *r3 = a0 = a0 + a1 */
+        0x9D60040Au,                                    /* bkpt */
+    };
+    uint32_t v = 0xDEADBEEFu;
+    int i;
+    prog(p, 3);
+    S.emr = 0xFFFF;                             /* unmask the address error */
+    S.r[22] = 0x800;                            /* evtp */
+    for (i = 0; i < 16; i++)                    /* every vector: bkpt */
+        dsp3210_poke(&S, 0x800u + (uint32_t)i * 8, 4, 0x9D60040Au);
+    dsp3210_acc_set(&S, 0, 1.0);
+    dsp3210_acc_set(&S, 1, 2.0);
+    run(40);
+    CHECK(S.last_vector == DSP3210_VEC_AERR);   /* vector 4 was raised */
+    CHECK(S.level == DSP3210_LVL_ERROR);        /* and dispatched */
+    dsp3210_peek(&S, 0x100, 4, &v);
+    CHECK(v == 0);                              /* the store was aborted */
+}
+
+static uint8_t hookmem[0x10000];
+
+static uint32_t t_hook_read(void *ctx, uint32_t addr, int size, int *fault)
+{
+    uint32_t v = 0;
+    int i;
+    (void)ctx; (void)fault;
+    for (i = 0; i < size; i++)                  /* big-endian */
+        v |= (uint32_t)hookmem[(addr + (uint32_t)i) & 0xFFFFu]
+             << (8 * (size - 1 - i));
+    return v;
+}
+
+static void t_hook_write(void *ctx, uint32_t addr, uint32_t val, int size,
+                         int *fault)
+{
+    int i;
+    (void)ctx; (void)fault;
+    for (i = 0; i < size; i++)
+        hookmem[(addr + (uint32_t)i) & 0xFFFFu] =
+            (uint8_t)(val >> (8 * (size - 1 - i)));
+}
+
+static void test_da_store_shadow_skipped_under_hooks(void)
+{
+    /* I1 stores a0 through r3; I2 reads the same word back one
+     * instruction later.  The core cannot snapshot hook-backed memory,
+     * so it must skip the shadow and read what the hook holds (the new
+     * value) rather than overlay bytes from the unused built-in map. */
+    const uint32_t p[] = {
+        e_set24(RC(3), 0x200),
+        e_damac(1, 4, 0, 0, 0, 0, DF_ACC(0), DF(3, 0)),  /* *r3 = a0 = a0 */
+        e_damac(1, 4, 0, 0, 1, 0, DF(3, 0), DF_NOWR),    /* a1 = *r3 */
+        0x9D60040Au,                                     /* bkpt */
+    };
+    int i;
+    prog(p, 4);
+    memset(hookmem, 0, sizeof hookmem);
+    for (i = 0; i < 4; i++)
+        t_hook_write(NULL, 4u * (uint32_t)i, p[i], 4, NULL);
+    t_hook_write(NULL, 0x200, dsp3210_double_to_dsp32(9.0), 4, NULL);
+    S.read_fn = t_hook_read;
+    S.write_fn = t_hook_write;
+    dsp3210_acc_set(&S, 0, 1.5);
+    dsp3210_acc_set(&S, 1, 0.0);
+    run(20);
+    /* 1.5 = shadow correctly skipped; 0 would be a fabricated shadow
+     * read out of the built-in array the embedder never populated */
+    CHECK(fabs(dsp3210_acc_get(&S, 1) - 1.5) < 1e-9);
+    S.read_fn = NULL;
+    S.write_fn = NULL;
+}
+
 int main(void)
 {
     test_set24_shiftor();
@@ -864,11 +1239,21 @@ int main(void)
     test_da_mult_acc();
     test_da_tap();
     test_da_int_float();
+    test_da_int_lane();
     test_da_ieee_dsp();
     test_da_seed();
     test_da_ic_oc();
     test_da_ifalt();
     test_dsp32_format();
+    test_da_store_thru_y();
+    test_da_mult_latency();
+    test_da_write_latency();
+    test_da_cond_latency();
+    test_ext_pin();
+    test_sio_obe_idle();
+    test_latency_settles_in_waiti();
+    test_da_store_misaligned_raises_aerr();
+    test_da_store_shadow_skipped_under_hooks();
 
     if (failures) {
         printf("%d FAILURE(S)\n", failures);

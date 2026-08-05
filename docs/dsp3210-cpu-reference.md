@@ -88,6 +88,13 @@ they are memory-mapped.)
 | 12 | `IR0` | external interrupt 0 pin state |
 | 13 | `IR1` | external interrupt 1 pin state |
 
+`IR0`/`IR1` mirror the **live level of the active-low EXT pins**:
+1 = negated, so idle pins read *set*, including immediately after
+reset.  The latched interrupt *request* is separate state - taking the
+interrupt clears the request, never the pin bit - and a write to `emr`
+with bit 0 set drops a latched-but-untaken EXT1 request without taking
+it (hardware-verified kernel behaviour).
+
 Bits 15-14 read 0.  Writing `ps` affects only `n z v c`.  Per-
 instruction flag effects are summarised in §9.  Note one behaviour the
 manual states only inside a pipeline restriction and shipped code
@@ -238,22 +245,39 @@ loop machinery is part of the state interrupts save/restore.  (In
 assembler source the counts are the raw field values: `do 2, 9` runs a
 three-instruction body ten times.)
 
-### 4.3 Pipeline restrictions (real hardware)
+### 4.3 DAU pipeline latencies (documented behaviour - schedulers use them)
 
-On silicon these are enforced by AT&T's assembler; they matter when
-writing code intended for hardware (this SDK's emulator is
-deliberately zero-latency and forgiving):
+The DAU pipeline gives three of [IM §4.4.2]'s four latency effects
+real, exploitable semantics (the fourth is the delayed branch, §4.1).
+These are **not** mere restrictions: shipped DSP code is
+software-pipelined against them, and this SDK's emulator models all
+three.
 
-- a CAU/IO register loaded from memory, and **the flags that load
-  set**, cannot be referenced by the very next instruction
-  [IM §4.4.1.3];
-- a DA memory write is not readable for 3 instructions; an accumulator
-  used as a *multiplier* input must have been written ≥3 instructions
-  earlier; DAU condition codes need ≥4;
-- a Z-field pointer that was post-modified may only be reused as a Z
-  pointer in the immediately following instruction;
-- a CAU/IO store may not directly follow a DA instruction with a
-  Y-field memory read.
+- **Latency 1 - DA memory writes** [IM §4.4.2.1]: the value a DA
+  instruction writes to memory is not readable *by the DSP itself*
+  until four instructions later; a read inside that window returns the
+  location's previous contents.  (Shipped code computes an in-place
+  FIR by reading, one word behind, what the previous iteration wrote -
+  correct only because the read lands inside the store's shadow.)
+- **Latency 2 - accumulator as multiplier input** [IM §4.4.2.2]: an
+  accumulator feeding the **multiplier** (the X field always, Y in
+  formats 2/3, and format 1's `aM` multiplicand) reads the value
+  established three instructions back.  Accumulators feeding the
+  **adder** read live.  (Shipped code closes a DC-blocking feedback
+  loop through exactly this three-instruction window.)
+- **Latency 4 - DAU conditions** [IM §4.4.2.4]: a DAU condition tested
+  by a conditional branch or conditional ALU instruction is the one
+  established four instructions back.  The `ifalt`/`ifaeq`/`ifagt`
+  conditional accumulator loads are the documented zero-latency
+  exception and always test the live flags.
+
+Separate from the latencies, the manual lists sequences its assembler
+simply rejects (no shipped code contains them, and this SDK does not
+model them): reusing a post-modified Z pointer in the next instruction
+other than as a Z pointer; a CAU/IO register store directly after a DA
+instruction with a Y-field memory read; and referencing a CAU/IO
+register (or **the flags its load set** [IM §4.4.1.3]) in the
+instruction after loading it.
 
 Exactly three things are non-interruptible for one cycle [IM §7.5.1]:
 register loads (from memory or IO register), all branch instructions,
@@ -371,7 +395,7 @@ for the wide-immediate formats) select the format:
 | `100000` | 0b/1b | `if (COND) goto {N, rB±N, pc±N}` - also `nop`, `ireturn` |
 | `100010` | - | **illegal opcode** |
 | `100011` | 3b/3c | `do` / `dolock` / `doblock` (bit 25: iteration count immediate/register) |
-| `100100` | 4b | `rD = rS <<| N` - shift-or |
+| `100100` | 4b | `rD = rS <<\| N` - shift-or |
 | `100101` | 5b | `rD = rS3 + N` (32-bit) |
 | `100110` | 6b/6d | 32-bit ALU (bit 25 as above) |
 | `100111` | 7b/7c/7d | register↔IO-reg, register↔memory, IO-reg↔memory moves |
@@ -517,7 +541,7 @@ per §6.5/§9.
 |---|---|---|
 | `rD = [(short)] rS3 + N` | 5a/5b | three-operand add with a 16-bit signed immediate; with `rS3 = r0` this is the **load-immediate** `rD = N` |
 | `rD = (ushort24) M` | 8b | load a 24-bit zero-extended immediate; **no flags** |
-| `rD = rS <<| N` | 4b | shift-or: `rD = rS \| (N << 16)` - pairs with 8b/5x to build any 32-bit constant in two instructions; always 32-bit |
+| `rD = rS <<\| N` | 4b | shift-or: `rD = rS \| (N << 16)` - pairs with 8b/5x to build any 32-bit constant in two instructions; always 32-bit |
 | `[if (cond)] rD = [(short)] rS1 op rS2` | 6a/6b | ALU register forms, `op` from §6.6 |
 | `rD = [(short)] rD op N` | 6c/6d | ALU immediate forms (16-bit signed N; shift counts use the 5 LSBs) |
 | `[if (cond)] [(short)] rS1 - rS2`, `rD - N` | 6x F=7 | compare: subtract, set flags, no store |
@@ -592,12 +616,17 @@ Field layout (formats 1, 2, 3):
   `110`/`111` = `--`/`++` by the operand size.
 - `p` = `0000`: register-direct - `i` = `000`-`011` selects a0-a3
   (X and Y only); `i` = `111` means **no Z write** (Z only).
-- `p` = `1111` is not allowed.
-
-Two spellings of "no Z write" exist in the wild: the manual's examples
-use `0000111` and shipped assembler output uses `1111111`; both are
-unambiguous (p=`1111` cannot address memory) and both must be
-accepted by tools.
+- `p` = `1111` in a Z field is a **store through the Y operand's own
+  effective address** (its pre-post-modify address), with the Z field's
+  `i` bits post-modifying **Y's pointer register** - the encoding of
+  every in-place read-modify-write (`*r2++ = a0 = *r2 * a1`) and
+  in-place conversion (`*r1 = a0 = float32(*r1)`).  When Y is an
+  accumulator there is nothing to store through and no write happens.
+  The manual's Table 10-3 calls p=`1111` "not allowed", and it was long
+  misread as a second spelling of "no write" (all the closely examined
+  words happened to have accumulator Ys); the store semantics are
+  hardware-verified against shipped audio code, which no-op'd under any
+  other reading.  In X/Y fields p=`1111` remains reserved.
 
 Within one instruction the operand order is Y, then X, then Z.  All
 three memory references transfer 32-bit DSP32 words; the arithmetic
@@ -626,11 +655,15 @@ is §3's semantics with 40-bit accumulation.
 | 13 | `dsp` | IEEE 754 single → DSP32; ±∞ saturates, denormals flush to 0, NaN raises vector 6 | N Z V U |
 | 14 | `seed` | reciprocal seed: invert all word bits except the sign - the Newton-Raphson division starter | N Z U, V=0 |
 
-G = 10, 11, 15 are reserved.  The int/byte-pattern results (`oc`,
-`int16`, `int32`, `ieee`) are meaningful in the **Z memory write**,
-which the manual requires to be issued in the same instruction; what
-remains in the accumulator's low bits is architecturally
-unpredictable.
+G = 10, 11, 15 are reserved.  The integer conversions deposit their
+result in the **accumulator's integer lane** - `int32` in the
+mantissa+guard bits (39-8), `int16` in the upper 16 of that lane, `oc`
+in its top byte - with only the exponent architecturally unpredictable
+[IM INT32/INT16/OC pages].  `ic`/`float16`/`float32` read the same
+lanes when Y names an accumulator, so `float32(int32(x))` is a defined
+round trip (used by shipped code to split a phase accumulator into
+integer and fractional parts).  The Z memory write must still be
+issued in the same instruction to get the result formatted in memory.
 
 ---
 
